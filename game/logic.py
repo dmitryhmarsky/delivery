@@ -1,8 +1,8 @@
 """Игровая логика без привязки к движку.
 
-Здесь только чистые функции и данные: урон грузу, расчёт оплаты, генерация заказов.
-Ничего из Ursina сюда не импортируется, поэтому этот файл легко переписать на Rust
-(1 функция = 1 функция) и легко тестировать без окна.
+Здесь только чистые функции и данные: урон грузу, оплата, ряды в фургоне,
+оценка «возни» с разгрузкой, длина маршрута. Ничего из Ursina сюда не
+импортируется, поэтому файл легко тестировать без окна и переписать на Rust.
 """
 from __future__ import annotations
 
@@ -16,28 +16,41 @@ SPRINT_SPEED = 8.0
 CREEP_SPEED = 2.0
 
 # Пороги скорости, выше которых груз страдает
-SHAKE_SPEED = 6.0     # бег трясёт груз
+SHAKE_SPEED = 6.0     # бег трясёт груз в руках
 NARROW_SPEED = 2.5    # в узком проходе надо идти медленно
+
+# Фургон
+VAN_MAX_SPEED = 11.0
+VAN_REVERSE_SPEED = 4.0
+VAN_ACCEL = 7.0
+VAN_COAST_DECEL = 8.0    # отпустил газ
+VAN_BRAKE_DECEL = 14.0   # нажал тормоз (S)
+SAFE_DECEL = 9.0         # торможение жёстче этого бьёт груз в кузове
+
+BAY_LANES = 2
+BAY_DEPTH = 4
 
 # fragility: множитель урона, pay: базовая оплата
 CARGO = {
     "parcel": {"name": "Посылка", "fragility": 0.6, "pay": 40},
     "cake": {"name": "Торт", "fragility": 1.1, "pay": 65},
-    "glass": {"name": "Стекло (хрупкое!)", "fragility": 1.6, "pay": 90},
+    "glass": {"name": "Стекло", "fragility": 1.6, "pay": 90},
 }
 
-# Наборы препятствий у дома
+# Наборы препятствий у домов (по одному на дом, перемешиваются)
 OBSTACLE_VARIANTS = [
     ["dog"],
     ["narrow"],
     ["sprinkler"],
     ["dog", "sprinkler"],
+    ["narrow", "sprinkler"],
+    [],
 ]
 
 
 # ---------------------------------------------------------------- урон грузу
 def shake_damage(speed: float, dt: float, fragility: float) -> float:
-    """Урон от тряски при беге."""
+    """Урон от тряски при беге с грузом в руках."""
     if speed <= SHAKE_SPEED:
         return 0.0
     return (speed - SHAKE_SPEED) * 4.0 * fragility * dt
@@ -61,20 +74,27 @@ def water_damage(dt: float, fragility: float) -> float:
 
 
 def dog_bite_damage(fragility: float) -> float:
-    """Разовый урон от укуса/толчка собаки."""
+    """Разовый урон от толчка собаки."""
     return 10.0 + 8.0 * fragility
+
+
+def hard_brake_damage(decel: float, speed: float, dt: float, fragility: float) -> float:
+    """Урон грузу в кузове при резком торможении на скорости."""
+    if decel <= SAFE_DECEL or speed <= 3.0:
+        return 0.0
+    return (decel - SAFE_DECEL) * min(speed, VAN_MAX_SPEED) / VAN_MAX_SPEED * 3.0 * fragility * dt
 
 
 # -------------------------------------------------------------------- оплата
 def time_multiplier(elapsed: float, limit: float) -> float:
     """1.0 пока укладываешься в срок, потом падает до 0.4."""
-    if elapsed <= limit:
+    if limit <= 0 or elapsed <= limit:
         return 1.0
     return max(0.4, 1.0 - (elapsed - limit) / limit * 0.6)
 
 
 def payment(base_pay: float, integrity: float, elapsed: float, limit: float) -> int:
-    """Итоговая оплата за доставку."""
+    """Итоговая оплата за одну посылку."""
     if integrity <= 0:
         return 0
     pay = base_pay * (integrity / MAX_INTEGRITY) * time_multiplier(elapsed, limit)
@@ -83,33 +103,114 @@ def payment(base_pay: float, integrity: float, elapsed: float, limit: float) -> 
     return int(round(pay))
 
 
-# -------------------------------------------------------------------- заказы
+def base_pay(kind: str, distance: float) -> int:
+    return CARGO[kind]["pay"] + int(distance * 0.4)
+
+
+# -------------------------------------------------------------------- груз
 @dataclass
-class Order:
+class Cargo:
+    id: int
     house_index: int
-    number: int
-    cargo: str
-    base_pay: int
-    time_limit: float
-    elapsed: float = 0.0
+    kind: str
     integrity: float = MAX_INTEGRITY
 
     @property
     def fragility(self) -> float:
-        return CARGO[self.cargo]["fragility"]
+        return CARGO[self.kind]["fragility"]
 
     @property
-    def cargo_name(self) -> str:
-        return CARGO[self.cargo]["name"]
+    def kind_name(self) -> str:
+        return CARGO[self.kind]["name"]
 
 
-def new_order(rng, houses: list[dict], last_index: int | None = None) -> Order:
-    """houses: [{'number': int, 'distance': float, 'obstacles': list[str]}, ...]"""
-    choices = [i for i in range(len(houses)) if i != last_index] or list(range(len(houses)))
-    idx = rng.choice(choices)
-    house = houses[idx]
-    cargo = rng.choice(list(CARGO))
-    dist = house["distance"]
-    base_pay = CARGO[cargo]["pay"] + int(dist * 0.6)
-    time_limit = int(40 + dist / 3.0 + 10 * len(house["obstacles"]))
-    return Order(idx, house["number"], cargo, base_pay, time_limit)
+def make_cargo(rng, n_houses: int) -> list[Cargo]:
+    """По одной посылке на каждый дом, в случайном порядке лежат на земле."""
+    houses = list(range(n_houses))
+    rng.shuffle(houses)
+    return [Cargo(i, h, rng.choice(list(CARGO))) for i, h in enumerate(houses)]
+
+
+class Bay:
+    """Кузов: 2 ряда по 4 места. Ряд это стопка: достать можно только то,
+    что лежит ближе всех к двери (конец списка). Положили последним, достаём первым."""
+
+    def __init__(self, lanes: int = BAY_LANES, depth: int = BAY_DEPTH):
+        self.depth = depth
+        self.lanes: list[list[int]] = [[] for _ in range(lanes)]
+
+    def can_push(self, lane: int) -> bool:
+        return len(self.lanes[lane]) < self.depth
+
+    def push(self, lane: int, item: int) -> None:
+        if not self.can_push(lane):
+            raise ValueError("ряд заполнен")
+        self.lanes[lane].append(item)
+
+    def peek(self, lane: int):
+        return self.lanes[lane][-1] if self.lanes[lane] else None
+
+    def pop(self, lane: int):
+        return self.lanes[lane].pop() if self.lanes[lane] else None
+
+    def remove(self, item: int) -> None:
+        for lane in self.lanes:
+            if item in lane:
+                lane.remove(item)
+                return
+
+    def find(self, item: int):
+        for li, lane in enumerate(self.lanes):
+            if item in lane:
+                return li, lane.index(item)
+        return None
+
+    def in_front(self, item: int) -> int:
+        """Сколько посылок лежит между этой и дверью."""
+        pos = self.find(item)
+        if pos is None:
+            return 0
+        li, idx = pos
+        return len(self.lanes[li]) - 1 - idx
+
+    def count(self) -> int:
+        return sum(len(lane) for lane in self.lanes)
+
+    def items(self) -> list[int]:
+        return [i for lane in self.lanes for i in lane]
+
+
+def dig_estimate(route: list[int], lanes: list[list[int]], house_of) -> int:
+    """Сколько посылок придётся вынуть, чтобы добраться до нужных по маршруту.
+
+    route: индексы домов по порядку, lanes: id посылок в рядах (конец = у двери),
+    house_of(id) -> индекс дома. Вынутые посылки возвращаются в тот же ряд."""
+    lanes = [list(lane) for lane in lanes]
+    total = 0
+    for house in route:
+        found = False
+        for lane in lanes:
+            for i, item in enumerate(lane):
+                if house_of(item) == house:
+                    total += len(lane) - 1 - i
+                    del lane[i]
+                    found = True
+                    break
+            if found:
+                break
+    return total
+
+
+# ------------------------------------------------------------------ маршрут
+def route_length(zs: list[float], start_z: float) -> float:
+    """Длина пути по улице от старта через все остановки по порядку."""
+    total, cur = 0.0, start_z
+    for z in zs:
+        total += abs(z - cur)
+        cur = z
+    return total
+
+
+def route_time_limit(length: float, stops: int, obstacles: int) -> int:
+    """Время на весь маршрут в секундах."""
+    return int(30 + length / 8.0 + stops * 28 + obstacles * 12)
