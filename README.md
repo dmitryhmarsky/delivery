@@ -5,6 +5,10 @@
 
 ## Запуск
 
+**Windows:** двойной клик по `run.bat`. При первом запуске он сам создаст окружение и поставит Ursina (нужен установленный Python 3.10+ с галочкой Add to PATH).
+
+Вручную:
+
 ```bash
 pip install -r requirements.txt
 python main.py
